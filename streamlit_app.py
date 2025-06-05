@@ -3,9 +3,11 @@ import pandas as pd
 from sentence_transformers import SentenceTransformer, LoggingHandler, models, util, losses, InputExample
 from sentence_transformers.datasets import DenoisingAutoEncoderDataset
 import torch
+from torch.utils.data import DataLoader # Added this import
 import os
 import logging
 from datetime import datetime
+import traceback # For more detailed error logging
 
 # --- 0. Setup Logging ---
 logging.basicConfig(format='%(asctime)s - %(message)s',
@@ -138,7 +140,6 @@ def train_model_pipeline(jobs_data_src, onet_data_src, base_model_name_for_train
     st.subheader("Stage 1: TSDAE Pre-training")
     logger.info("--- Starting Stage 1: TSDAE Pre-training ---")
     
-    # Data for TSDAE. process_jobs_csv_for_training_and_corpus populates globals.
     processed_jobs_df, train_sentences_tsdae = process_jobs_csv_for_training_and_corpus(jobs_data_src)
 
     if not train_sentences_tsdae or processed_jobs_df is None:
@@ -162,7 +163,9 @@ def train_model_pipeline(jobs_data_src, onet_data_src, base_model_name_for_train
         tsdae_train_model.fit(
             train_objectives=[(tsdae_dataloader, tsdae_loss)], epochs=TSDAE_EPOCHS,
             weight_decay=0, scheduler='WarmupLinear', optimizer_params={'lr': TSDAE_LEARNING_RATE},
-            warmup_steps=100, show_progress_bar=True, use_amp=True
+            warmup_steps=100, 
+            show_progress_bar=False, # Disabled for Streamlit compatibility
+            use_amp=True
         )
     st.write("TSDAE pre-training complete.")
     
@@ -196,8 +199,9 @@ def train_model_pipeline(jobs_data_src, onet_data_src, base_model_name_for_train
         sbert_model_to_finetune.fit(
             train_objectives=[(sbert_train_dataloader_mnrl, sbert_loss_mnrl)], epochs=SBERT_EPOCHS,
             warmup_steps=sbert_warmup_steps, optimizer_params={'lr': SBERT_LEARNING_RATE},
-            weight_decay=0.01, # output_path=final_model_save_path, # Removed to save explicitly after fit
-            show_progress_bar=True, use_amp=True, save_best_model=False 
+            weight_decay=0.01, 
+            show_progress_bar=False, # Disabled for Streamlit compatibility
+            use_amp=True, save_best_model=False 
         )
     
     os.makedirs(final_model_save_path, exist_ok=True)
@@ -221,9 +225,7 @@ onet_csv_source_input = st.sidebar.text_input("ONET Data Source (Path or URL, fo
 model_file_check_path = os.path.join(model_output_dir_input, "pytorch_model.bin")
 
 # Attempt to load job corpus early, as it's needed whether model is loaded or trained
-# This also populates jobs_df_original_global
-# Do this only once at the start, or if jobs_csv_source_input changes (more complex for now)
-if not job_corpus_texts_global: # Initialize if empty
+if not job_corpus_texts_global: 
     process_jobs_csv_for_training_and_corpus(jobs_csv_source_input)
 
 
@@ -234,39 +236,43 @@ if os.path.exists(model_file_check_path):
         try:
             model = SentenceTransformer(model_output_dir_input)
             st.sidebar.success("Pre-trained model loaded successfully!")
-            # Job corpus should already be loaded by the call above
-            if not job_corpus_texts_global: # Double check if corpus loading failed for some reason
+            if not job_corpus_texts_global: 
                  st.sidebar.error("Job corpus could not be loaded even though model exists. Check Jobs Data Source and refresh.")
         except Exception as e:
             st.sidebar.error(f"Error loading model: {e}. Training may be required.")
+            logger.error(f"Error loading existing model: {e}\n{traceback.format_exc()}")
             model = None 
 else:
     st.sidebar.warning(f"Trained model not found at '{model_output_dir_input}'.")
     if st.sidebar.button("Train New Model (Time Consuming!)"):
-        # Ensure corpus is loaded before attempting to train
         if not job_corpus_texts_global:
-            # Attempt to load corpus again if it failed earlier, using current sidebar input
             st.sidebar.info("Attempting to load job data before training...")
             process_jobs_csv_for_training_and_corpus(jobs_csv_source_input) 
         
-        if not job_corpus_texts_global : # Check again after attempt
+        if not job_corpus_texts_global : 
             st.sidebar.error("Cannot train model: Jobs data (corpus) failed to load. Check Jobs Data Source in sidebar.")
         else:
-            training_successful = train_model_pipeline(
-                jobs_csv_source_input, 
-                onet_csv_source_input, 
-                BASE_MODEL_NAME_FOR_TRAINING, 
-                model_output_dir_input 
-            )
-            if training_successful:
-                try:
-                    model = SentenceTransformer(model_output_dir_input) 
-                    st.sidebar.success("Model trained and loaded successfully!")
-                except Exception as e:
-                     st.sidebar.error(f"Error loading newly trained model: {e}")
-                     model = None
-            else:
-                st.sidebar.error("Model training failed.")
+            try:
+                training_successful = train_model_pipeline(
+                    jobs_csv_source_input, 
+                    onet_csv_source_input, 
+                    BASE_MODEL_NAME_FOR_TRAINING, 
+                    model_output_dir_input 
+                )
+                if training_successful:
+                    try:
+                        model = SentenceTransformer(model_output_dir_input) 
+                        st.sidebar.success("Model trained and loaded successfully!")
+                    except Exception as e_load:
+                         st.sidebar.error(f"Error loading newly trained model: {e_load}")
+                         logger.error(f"Error loading newly trained model: {e_load}\n{traceback.format_exc()}")
+                         model = None
+                else:
+                    st.sidebar.error("Model training failed.")
+                    model = None
+            except Exception as e_train_pipe:
+                st.sidebar.error(f"Error during training pipeline: {e_train_pipe}")
+                logger.error(f"Training pipeline error: {e_train_pipe}\n{traceback.format_exc()}")
                 model = None
 
 
@@ -277,22 +283,25 @@ if model and job_corpus_texts_global and jobs_df_original_global is not None:
     @st.cache_data 
     def get_or_encode_corpus(_model_path_for_cache_key, _corpus_texts_for_cache_key_tuple):
         _corpus_texts_list = list(_corpus_texts_for_cache_key_tuple)
-        loaded_model_for_encoding = SentenceTransformer(_model_path_for_cache_key)
-        logger.info(f"Encoding corpus of {len(_corpus_texts_list)} documents for dashboard...")
-        corpus_embeddings = loaded_model_for_encoding.encode(
-            _corpus_texts_list, 
-            convert_to_tensor=True, 
-            show_progress_bar=False # Disabled for potentially better Streamlit compatibility
-        )
-        logger.info("Dashboard corpus encoding complete.")
-        return corpus_embeddings
+        # It's better to pass the loaded model to cached functions if possible,
+        # but if model loading is part of the app state, using path as key is a workaround.
+        try:
+            loaded_model_for_encoding = SentenceTransformer(_model_path_for_cache_key)
+            logger.info(f"Encoding corpus of {len(_corpus_texts_list)} documents for dashboard...")
+            corpus_embeddings = loaded_model_for_encoding.encode(
+                _corpus_texts_list, 
+                convert_to_tensor=True, 
+                show_progress_bar=False # Disabled for potentially better Streamlit compatibility
+            )
+            logger.info("Dashboard corpus encoding complete.")
+            return corpus_embeddings
+        except Exception as e:
+            st.error(f"Error encoding corpus within cached function: {e}")
+            logger.error(f"Cached corpus encoding error: {e}\n{traceback.format_exc()}")
+            return None
 
-    try:
-        corpus_embeddings = get_or_encode_corpus(model_output_dir_input, tuple(job_corpus_texts_global))
-    except Exception as e:
-        st.error(f"Error encoding corpus for dashboard: {e}. Check model path and data.")
-        logger.error(f"Dashboard corpus encoding error: {e}\n{traceback.format_exc()}")
-        corpus_embeddings = None
+
+    corpus_embeddings = get_or_encode_corpus(model_output_dir_input, tuple(job_corpus_texts_global))
 
 
     if corpus_embeddings is not None:
@@ -337,13 +346,13 @@ if model and job_corpus_texts_global and jobs_df_original_global is not None:
                     except Exception as e:
                         st.error(f"Error during recommendation: {e}")
                         logger.error(f"Recommendation error: {e}")
-                        import traceback # Make sure traceback is imported if used here
                         logger.error(traceback.format_exc())
         
         # Optional ONET Comparison
         if DEFAULT_ONET_CSV_SOURCE: 
             onet_titles_for_comparison = None
             try:
+                # Use the sidebar input path for consistency and user override
                 onet_df_comp = pd.read_csv(onet_csv_source_input) 
                 if 'Title' in onet_df_comp.columns:
                     onet_titles_for_comparison = onet_df_comp['Title'].dropna().unique().tolist()
@@ -372,9 +381,7 @@ if model and job_corpus_texts_global and jobs_df_original_global is not None:
                     except Exception as e:
                         st.error(f"Error during ONET comparison: {e}")
                         logger.error(f"ONET comparison error: {e}")
-                        import traceback # Ensure traceback is imported
                         logger.error(traceback.format_exc())
-
                 else:
                     st.info("Enter a query above to see its similarity to ONET titles.")
     else:
