@@ -1,19 +1,31 @@
 import streamlit as st
 import pandas as pd
 from sentence_transformers import SentenceTransformer, LoggingHandler, models, util, losses, InputExample
-from sentence_transformers.datasets import DenoisingAutoEncoderDataset # Added this missing import
+from sentence_transformers.datasets import DenoisingAutoEncoderDataset
 from torch.utils.data import DataLoader
 import torch
 import os
 import logging
 from datetime import datetime
 import traceback
+import nltk # Added for downloading necessary resources
 
 # --- 0. Setup Logging ---
 logging.basicConfig(format='%(asctime)s - %(message)s',
                     datefmt='%Y-%m-%d %H:%M:%S',
                     level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# --- Function to Download NLTK data ---
+@st.cache_resource
+def setup_nltk():
+    """Downloads the 'punkt' resource from NLTK if not already present."""
+    try:
+        nltk.data.find('tokenizers/punkt')
+    except LookupError:
+        logger.info("NLTK 'punkt' resource not found. Downloading...")
+        nltk.download('punkt')
+        logger.info("'punkt' resource downloaded successfully.")
 
 # --- 1. Configuration ---
 # Path where the final fine-tuned model should be saved/loaded from.
@@ -182,6 +194,10 @@ def encode_corpus(_model, _corpus_texts_tuple):
 
 # --- Streamlit App UI ---
 st.set_page_config(layout="wide")
+
+# Download NLTK data at the start of the app
+setup_nltk()
+
 st.title("✨ Job Recommendation Dashboard ✨")
 st.write("Powered by a domain-adapted TSDAE-SBERT model.")
 
