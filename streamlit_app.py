@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 from sentence_transformers import SentenceTransformer, LoggingHandler, models, util, losses, InputExample
+from sentence_transformers.datasets import DenoisingAutoEncoderDataset # Added this missing import
 from torch.utils.data import DataLoader
 import torch
 import os
@@ -46,6 +47,7 @@ def process_jobs_csv_for_corpus(filepath_or_df):
     Reads the jobs CSV, combines relevant text columns into single strings.
     This function is cached to avoid re-reading and re-processing the file on every script rerun.
     """
+    global jobs_df_original_global # Declare that we will modify this global
     logger.info(f"Processing jobs data. Input type: {type(filepath_or_df)}")
     try:
         if isinstance(filepath_or_df, str):
@@ -58,6 +60,9 @@ def process_jobs_csv_for_corpus(filepath_or_df):
     except Exception as e:
         logger.error(f"Error processing jobs data source {filepath_or_df}: {e}")
         return None, []
+
+    # Store the original dataframe in the global variable
+    jobs_df_original_global = jobs_df.copy()
 
     columns_to_combine = [
         'Job.ID', 'Status', 'Title', 'Position', 'Company', 'City', 'State.Name',
@@ -105,6 +110,7 @@ def train_model_pipeline(jobs_data_src, onet_data_src, base_model, final_save_pa
     
     # Stage 1: TSDAE
     st.subheader("Stage 1: TSDAE Pre-training")
+    # This call populates the global variables as a side effect.
     _, train_sentences_tsdae = process_jobs_csv_for_corpus(jobs_data_src)
     if not train_sentences_tsdae:
         st.error("TSDAE training failed: No job data processed.")
@@ -158,13 +164,14 @@ def train_model_pipeline(jobs_data_src, onet_data_src, base_model, final_save_pa
 def load_model(model_path):
     logger.info(f"Loading fine-tuned model from: {model_path}")
     if not os.path.exists(model_path):
-        st.error(f"Model not found at local path: {model_path}.")
+        # This is expected if the model hasn't been trained yet, so we don't show an error here.
+        logger.warning(f"Model not found at local path: {model_path}.")
         return None
     try:
         model = SentenceTransformer(model_path)
         return model
     except Exception as e:
-        st.error(f"Error loading model: {e}")
+        st.error(f"Error loading model from {model_path}: {e}")
         return None
 
 @st.cache_data
@@ -185,6 +192,7 @@ jobs_csv_source_input = st.sidebar.text_input("Jobs Data Source (Path or URL):",
 onet_csv_source_input = st.sidebar.text_input("ONET Data Source (Path or URL, for training):", DEFAULT_ONET_CSV_SOURCE)
 
 # Load data and model
+# This populates jobs_df_original_global and job_corpus_texts_global
 jobs_df_original_global, job_corpus_texts_global = process_jobs_csv_for_corpus(jobs_csv_source_input)
 model = load_model(model_output_dir_input)
 
@@ -198,8 +206,8 @@ if model is None:
                 BASE_MODEL_NAME_FOR_TRAINING, model_output_dir_input
             )
             if training_successful:
-                model = load_model(model_output_dir_input)
-                st.experimental_rerun() # Rerun the app to load the new model state
+                # Use st.experimental_rerun() to reload the app and load the new model
+                st.experimental_rerun()
         else:
             st.sidebar.error("Cannot train model: Job data failed to load. Check Jobs Data Source.")
 
@@ -235,7 +243,7 @@ if model and jobs_df_original_global is not None and job_corpus_texts_global:
                             job_index = idx.item()
                             original_job_series = jobs_df_original_global.iloc[job_index]
 
-                            with st.expander(f"**Rank {i+1}: {original_job_series.get('Title', 'N/A')}** at {original_job_series.get('Company', 'N/A')} (Score: {score.item():.4f})"):
+                            with st.expander(f"**Rank {i+1}: {original_job_series.get('Title', 'N/A')}** at **{original_job_series.get('Company', 'N/A')}** (Score: {score.item():.4f})"):
                                 st.markdown("---")
                                 col1, col2 = st.columns(2)
                                 with col1:
