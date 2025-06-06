@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 from sentence_transformers import SentenceTransformer, LoggingHandler, models, util, losses, InputExample
-from sentence_transformers.datasets import DenoisingAutoEncoderDataset
 from torch.utils.data import DataLoader
 import torch
 import os
@@ -10,22 +9,23 @@ from datetime import datetime
 import traceback
 import nltk # Added for downloading necessary resources
 
+# --- Pre-run Setup: Download NLTK data ---
+# This is placed at the top level to ensure it runs once when the script starts.
+try:
+    nltk.data.find('tokenizers/punkt')
+    logging.info("NLTK 'punkt' resource already downloaded.")
+except LookupError:
+    logging.info("NLTK 'punkt' resource not found. Downloading...")
+    nltk.download('punkt')
+    logging.info("'punkt' resource downloaded successfully.")
+
+
 # --- 0. Setup Logging ---
 logging.basicConfig(format='%(asctime)s - %(message)s',
                     datefmt='%Y-%m-%d %H:%M:%S',
                     level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Function to Download NLTK data ---
-@st.cache_resource
-def setup_nltk():
-    """Downloads the 'punkt' resource from NLTK if not already present."""
-    try:
-        nltk.data.find('tokenizers/punkt')
-    except LookupError:
-        logger.info("NLTK 'punkt' resource not found. Downloading...")
-        nltk.download('punkt')
-        logger.info("'punkt' resource downloaded successfully.")
 
 # --- 1. Configuration ---
 # Path where the final fine-tuned model should be saved/loaded from.
@@ -99,6 +99,7 @@ def process_onet_csv_for_sbert_training(filepath_or_df):
     """
     Reads the ONET CSV and creates a list of InputExample objects for training.
     """
+    from sentence_transformers import InputExample # Import inside function to avoid circular dependencies
     examples = []
     try:
         if isinstance(filepath_or_df, str):
@@ -118,6 +119,11 @@ def process_onet_csv_for_sbert_training(filepath_or_df):
 
 # --- Model Training Pipeline ---
 def train_model_pipeline(jobs_data_src, onet_data_src, base_model, final_save_path):
+    # These imports are needed for the training process itself
+    from sentence_transformers.datasets import DenoisingAutoEncoderDataset
+    from sentence_transformers import losses
+    from torch.utils.data import DataLoader
+
     st.info(f"Starting model training pipeline. This will take a significant amount of time...")
     
     # Stage 1: TSDAE
@@ -171,12 +177,11 @@ def train_model_pipeline(jobs_data_src, onet_data_src, base_model, final_save_pa
     st.success(f"Model training complete! Fine-tuned model saved to: {final_save_path}")
     return True
 
-# --- Load Model and Precompute Embeddings (Cached) ---
+# --- Load Model (Cached) ---
 @st.cache_resource
 def load_model(model_path):
     logger.info(f"Loading fine-tuned model from: {model_path}")
     if not os.path.exists(model_path):
-        # This is expected if the model hasn't been trained yet, so we don't show an error here.
         logger.warning(f"Model not found at local path: {model_path}.")
         return None
     try:
@@ -186,6 +191,7 @@ def load_model(model_path):
         st.error(f"Error loading model from {model_path}: {e}")
         return None
 
+# --- Encode Corpus (Cached) ---
 @st.cache_data
 def encode_corpus(_model, _corpus_texts_tuple):
     corpus_texts = list(_corpus_texts_tuple)
@@ -195,7 +201,7 @@ def encode_corpus(_model, _corpus_texts_tuple):
 # --- Streamlit App UI ---
 st.set_page_config(layout="wide")
 
-# Download NLTK data at the start of the app
+# This will run once at the start of the app
 setup_nltk()
 
 st.title("✨ Job Recommendation Dashboard ✨")
@@ -222,7 +228,7 @@ if model is None:
                 BASE_MODEL_NAME_FOR_TRAINING, model_output_dir_input
             )
             if training_successful:
-                # Use st.experimental_rerun() to reload the app and load the new model
+                # Rerun the app to load the new model state
                 st.experimental_rerun()
         else:
             st.sidebar.error("Cannot train model: Job data failed to load. Check Jobs Data Source.")
