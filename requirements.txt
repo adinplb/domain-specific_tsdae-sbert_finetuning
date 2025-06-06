@@ -3,3 +3,4 @@ pandas
 sentence-transformers 
 torch
 nltk
+datasets
