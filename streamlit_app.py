@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import torch
 from sentence_transformers import SentenceTransformer, util
-import os
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -13,8 +12,6 @@ st.set_page_config(
 
 # --- Configuration ---
 # We will load a pre-trained model directly from the Hugging Face Hub.
-# This is the base model used in your training notebook.
-# If you upload your fine-tuned model to the Hub, you can change this to "your-username/your-model-name".
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 JOBS_DATA_URL = "https://raw.githubusercontent.com/adinplb/tsdae-embeddings/refs/heads/master/dataset/Filtered_Jobs_4000.csv"
 
@@ -118,7 +115,6 @@ if model:
             st.write("") # Spacer
             find_button = st.button("✨ Find My Dream Job", use_container_width=True)
 
-
         if find_button:
             if not user_query.strip():
                 st.warning("Please enter a query.")
@@ -137,20 +133,34 @@ if model:
 
                     st.success(f"Here are your top {top_n} job recommendations:")
 
-                    # Display results in a structured format
-                    results_list = []
+                    # NEW: Display results in an expander format
                     for i, (score, idx) in enumerate(zip(top_results.values, top_results.indices)):
                         job_index = idx.item()
                         original_job = jobs_df.iloc[job_index]
-                        results_list.append({
-                            "Rank": i + 1,
-                            "Score": f"{score.item():.4f}",
-                            "Title": original_job.get('Title', 'N/A'),
-                            "Company": original_job.get('Company', 'N/A'),
-                            "Location": f"{original_job.get('City', '')}, {original_job.get('State.Name', '')}"
-                        })
+                        
+                        # Prepare the title for the expander
+                        expander_title = f"**{i+1}. {original_job.get('Title', 'N/A')}** at **{original_job.get('Company', 'N/A')}** (Score: {score.item():.2f})"
+                        
+                        with st.expander(expander_title):
+                            # Create two columns for a cleaner layout
+                            col1, col2 = st.columns(2)
+                            
+                            with col1:
+                                st.markdown(f"**Position:** {original_job.get('Position', 'N/A')}")
+                                st.markdown(f"**Location:** {original_job.get('City', 'N/A')}, {original_job.get('State.Name', 'N/A')}")
+                                st.markdown(f"**Employment Type:** {original_job.get('Employment.Type', 'N/A')}")
+                                
+                            with col2:
+                                st.markdown(f"**Industry:** {original_job.get('Industry', 'N/A')}")
+                                st.markdown(f"**Education Required:** {original_job.get('Education.Required', 'N/A')}")
 
-                    recommendations_df = pd.DataFrame(results_list)
-                    st.table(recommendations_df)
+                            st.markdown("---")
+                            
+                            st.markdown("**Job Description:**")
+                            st.info(original_job.get('Job.Description', 'No description available.'))
+                            
+                            st.markdown("**Requirements:**")
+                            st.info(original_job.get('Requirements', 'No requirements listed.'))
+
 else:
     st.error("The recommendation engine is currently unavailable. The model could not be loaded from Hugging Face Hub.")
