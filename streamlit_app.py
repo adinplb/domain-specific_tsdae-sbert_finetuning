@@ -14,7 +14,7 @@ st.set_page_config(
 )
 
 # --- Configuration ---
-MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+MODEL_NAME = "adinplb/job-recommendation-sbert"
 JOBS_DATA_URL = "https://raw.githubusercontent.com/adinplb/tsdae-embeddings/refs/heads/master/dataset/Filtered_Jobs_4000.csv"
 MAX_CV_UPLOADS = 10
 
