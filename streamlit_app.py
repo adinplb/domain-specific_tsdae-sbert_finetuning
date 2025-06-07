@@ -9,6 +9,9 @@ from docx import Document
 import io
 import os
 import logging
+import nltk 
+
+nltk.download('punkt_tab')
 
 # --- Page and Logging Configuration ---
 st.set_page_config(
