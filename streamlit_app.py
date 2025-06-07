@@ -1,284 +1,156 @@
 import streamlit as st
 import pandas as pd
-from sentence_transformers import SentenceTransformer, LoggingHandler, models, util, losses, InputExample
-from torch.utils.data import DataLoader
 import torch
+from sentence_transformers import SentenceTransformer, util
 import os
-import logging
-from datetime import datetime
-import traceback
-import nltk
 
-# --- Pre-run Setup: Download NLTK data ---
-# This is placed at the top level to ensure it runs once when the script starts.
-try:
-    nltk.data.find('tokenizers/punkt')
-    logging.info("NLTK 'punkt' resource already downloaded.")
-except LookupError:
-    logging.info("NLTK 'punkt' resource not found. Downloading...")
-    nltk.download('punkt')
-    logging.info("'punkt' resource downloaded successfully.")
+# --- Page Configuration ---
+st.set_page_config(
+    page_title="Job Recommendation Engine",
+    page_icon="🤖",
+    layout="wide",
+)
 
+# --- Configuration ---
+# We will load a pre-trained model directly from the Hugging Face Hub.
+# This is the base model used in your training notebook.
+# If you upload your fine-tuned model to the Hub, you can change this to "your-username/your-model-name".
+MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+JOBS_DATA_URL = "https://raw.githubusercontent.com/adinplb/tsdae-embeddings/refs/heads/master/dataset/Filtered_Jobs_4000.csv"
 
-# --- 0. Setup Logging ---
-logging.basicConfig(format='%(asctime)s - %(message)s',
-                    datefmt='%Y-%m-%d %H:%M:%S',
-                    level=logging.INFO)
-logger = logging.getLogger(__name__)
+# --- Caching Functions for Performance ---
 
-# --- 1. Configuration ---
-# Path where the final fine-tuned model should be saved/loaded from.
-DEFAULT_TRAINED_MODEL_OUTPUT_DIR = "trained_job_recommender_model" 
-
-# Default paths to original CSV data files (can be URLs or local paths).
-DEFAULT_JOBS_CSV_SOURCE = "https://raw.githubusercontent.com/adinplb/tsdae-embeddings/refs/heads/master/dataset/Filtered_Jobs_4000.csv"
-DEFAULT_ONET_CSV_SOURCE = "https://raw.githubusercontent.com/adinplb/tsdae-embeddings/refs/heads/master/dataset/Occupation%20Data.csv"
-
-# Base model for training.
-BASE_MODEL_NAME_FOR_TRAINING = 'sentence-transformers/all-MiniLM-L6-v2'
-
-# Training Hyperparameters.
-TSDAE_EPOCHS = 1
-TSDAE_BATCH_SIZE = 32
-TSDAE_LEARNING_RATE = 3e-5
-TSDAE_MAX_SEQ_LENGTH = 256
-
-SBERT_EPOCHS = 1
-SBERT_BATCH_SIZE = 16
-SBERT_LEARNING_RATE = 2e-5
-
-# Globals to store data to avoid re-processing.
-job_corpus_texts_global = []
-jobs_df_original_global = None
-
-# --- Helper Functions for Data Processing ---
-@st.cache_data
-def process_jobs_csv_for_corpus(filepath_or_df):
-    global jobs_df_original_global 
-    logger.info(f"Processing jobs data. Input type: {type(filepath_or_df)}")
-    try:
-        if isinstance(filepath_or_df, str):
-            jobs_df = pd.read_csv(filepath_or_df)
-        elif isinstance(filepath_or_df, pd.DataFrame):
-            jobs_df = filepath_or_df.copy()
-        else:
-            logger.error("Invalid input for jobs data: Expected filepath string or pandas DataFrame.")
-            return None, []
-    except Exception as e:
-        logger.error(f"Error processing jobs data source {filepath_or_df}: {e}")
-        return None, []
-
-    jobs_df_original_global = jobs_df.copy()
-
-    columns_to_combine = [
-        'Job.ID', 'Status', 'Title', 'Position', 'Company', 'City', 'State.Name',
-        'Industry', 'Job.Description', 'Requirements', 'Salary', 'Employment.Type',
-        'Education.Required'
-    ]
-    existing_columns = [col for col in columns_to_combine if col in jobs_df.columns]
-    
-    if not existing_columns:
-        logger.error("No specified columns for corpus found in the jobs CSV/DataFrame.")
-        return jobs_df.copy(), []
-
-    logger.info(f"Combining columns for corpus: {existing_columns}")
-    jobs_df_filled = jobs_df[existing_columns].fillna('').astype(str)
-    processed_texts = jobs_df_filled.agg(' '.join, axis=1).tolist()
-    cleaned_texts = [text.replace('\n', ' ').replace('\r', ' ') for text in processed_texts]
-    
-    logger.info(f"Processed {len(cleaned_texts)} job entries for corpus.")
-    return jobs_df.copy(), cleaned_texts
-
-def process_onet_csv_for_sbert_training(filepath_or_df):
-    examples = []
-    try:
-        if isinstance(filepath_or_df, str):
-            onet_df = pd.read_csv(filepath_or_df)
-        elif isinstance(filepath_or_df, pd.DataFrame):
-            onet_df = filepath_or_df.copy()
-        else:
-            return []
-    except Exception as e:
-        logger.error(f"Error processing ONET data source {filepath_or_df}: {e}")
-        return []
-
-    if 'Title' in onet_df.columns and 'Description' in onet_df.columns:
-        for _, row in onet_df.iterrows():
-            examples.append(InputExample(texts=[str(row['Title']), str(row['Description'])], label=1.0))
-    return examples
-
-# --- Model Training Pipeline ---
-def train_model_pipeline(jobs_data_src, onet_data_src, base_model, final_save_path):
-    from sentence_transformers.datasets import DenoisingAutoEncoderDataset
-    from sentence_transformers import losses
-    
-    st.info(f"Starting model training pipeline. This will take a significant amount of time...")
-    
-    # Stage 1: TSDAE
-    st.subheader("Stage 1: TSDAE Pre-training")
-    _, train_sentences_tsdae = process_jobs_csv_for_corpus(jobs_data_src)
-    if not train_sentences_tsdae:
-        st.error("TSDAE training failed: No job data processed.")
-        return False
-
-    with st.spinner("Training TSDAE model..."):
-        word_embedding_model = models.Transformer(base_model, max_seq_length=TSDAE_MAX_SEQ_LENGTH)
-        pooling_model = models.Pooling(word_embedding_model.get_word_embedding_dimension(), pooling_mode='mean')
-        tsdae_train_model = SentenceTransformer(modules=[word_embedding_model, pooling_model])
-        tsdae_dataset = DenoisingAutoEncoderDataset(train_sentences_tsdae)
-        tsdae_dataloader = DataLoader(tsdae_dataset, batch_size=TSDAE_BATCH_SIZE, shuffle=True)
-        tsdae_loss = losses.DenoisingAutoEncoderLoss(model=tsdae_train_model, decoder_name_or_path=base_model, tie_encoder_decoder=True)
-        
-        tsdae_train_model.fit(
-            train_objectives=[(tsdae_dataloader, tsdae_loss)], epochs=TSDAE_EPOCHS,
-            weight_decay=0, scheduler='WarmupLinear', optimizer_params={'lr': TSDAE_LEARNING_RATE},
-            warmup_steps=100, show_progress_bar=False, use_amp=True
-        )
-    st.write("TSDAE pre-training complete.")
-    
-    temp_tsdae_output_path = '/tmp/temp_tsdae_model'
-    tsdae_train_model.save(temp_tsdae_output_path)
-    
-    # Stage 2: SBERT
-    st.subheader("Stage 2: SBERT Fine-tuning")
-    sbert_train_samples = process_onet_csv_for_sbert_training(onet_data_src)
-    if not sbert_train_samples:
-        st.error("SBERT fine-tuning failed: No ONET data processed.")
-        return False
-        
-    with st.spinner("Fine-tuning SBERT model..."):
-        sbert_model_to_finetune = SentenceTransformer(temp_tsdae_output_path)
-        num_train_steps_sbert = len(sbert_train_samples) // SBERT_BATCH_SIZE * SBERT_EPOCHS
-        sbert_warmup_steps = int(0.1 * num_train_steps_sbert)
-        sbert_train_dataloader = DataLoader(sbert_train_samples, shuffle=True, batch_size=SBERT_BATCH_SIZE)
-        sbert_loss = losses.MultipleNegativesRankingLoss(model=sbert_model_to_finetune)
-        
-        sbert_model_to_finetune.fit(
-            train_objectives=[(sbert_train_dataloader, sbert_loss)], epochs=SBERT_EPOCHS,
-            warmup_steps=sbert_warmup_steps, optimizer_params={'lr': SBERT_LEARNING_RATE},
-            weight_decay=0.01, show_progress_bar=False, use_amp=True
-        )
-    
-    os.makedirs(final_save_path, exist_ok=True)
-    sbert_model_to_finetune.save(final_save_path)
-    st.success(f"Model training complete! Fine-tuned model saved to: {final_save_path}")
-    return True
-
-# --- Load Model and Precompute Embeddings (Cached) ---
 @st.cache_resource
-def load_model(model_path):
-    logger.info(f"Loading fine-tuned model from: {model_path}")
-    if not os.path.exists(model_path):
-        logger.warning(f"Model not found at local path: {model_path}.")
-        return None
+def load_model(model_name):
+    """
+    Loads a SentenceTransformer model from the Hugging Face Hub.
+    Using st.cache_resource ensures the model is loaded only once.
+    """
     try:
-        model = SentenceTransformer(model_path)
+        model = SentenceTransformer(model_name)
         return model
     except Exception as e:
-        st.error(f"Error loading model from {model_path}: {e}")
+        st.error(f"Error loading the model '{model_name}': {e}")
         return None
 
 @st.cache_data
-def encode_corpus(_model, _corpus_texts_tuple):
-    corpus_texts = list(_corpus_texts_tuple)
-    logger.info(f"Encoding corpus of {len(corpus_texts)} documents...")
-    return _model.encode(corpus_texts, convert_to_tensor=True, show_progress_bar=False)
+def load_and_process_job_data(url):
+    """
+    Loads job data from a URL and prepares the text corpus for embedding.
+    Using st.cache_data ensures the data is loaded and processed only once.
+    """
+    try:
+        jobs_df = pd.read_csv(url)
+    except Exception as e:
+        st.error(f"Failed to load data from URL: {e}")
+        return None, []
 
-# --- Streamlit App UI ---
-st.set_page_config(layout="wide")
-st.title("✨ Job Recommendation Dashboard ✨")
-st.write("Powered by a domain-adapted TSDAE-SBERT model.")
-
-# Sidebar Configuration
-st.sidebar.header("Setup & Configuration")
-model_output_dir_input = st.sidebar.text_input("Trained Model Directory:", DEFAULT_TRAINED_MODEL_OUTPUT_DIR)
-jobs_csv_source_input = st.sidebar.text_input("Jobs Data Source (Path or URL):", DEFAULT_JOBS_CSV_SOURCE)
-onet_csv_source_input = st.sidebar.text_input("ONET Data Source (Path or URL, for training):", DEFAULT_ONET_CSV_SOURCE)
-
-# Load data and model
-# This populates jobs_df_original_global and job_corpus_texts_global
-jobs_df_original_global, job_corpus_texts_global = process_jobs_csv_for_corpus(jobs_csv_source_input)
-model = load_model(model_output_dir_input)
-
-# Check if model exists, if not, offer to train it.
-if model is None:
-    st.sidebar.warning(f"Trained model not found at '{model_output_dir_input}'.")
-    if st.sidebar.button("Train New Model (Time Consuming!)"):
-        if job_corpus_texts_global:
-            training_successful = train_model_pipeline(
-                jobs_csv_source_input, onet_csv_source_input, 
-                BASE_MODEL_NAME_FOR_TRAINING, model_output_dir_input
-            )
-            if training_successful:
-                st.experimental_rerun()
-        else:
-            st.sidebar.error("Cannot train model: Job data failed to load. Check Jobs Data Source.")
-
-# Main dashboard area
-if model and jobs_df_original_global is not None and job_corpus_texts_global:
-    st.sidebar.success(f"Model loaded and {len(job_corpus_texts_global)} jobs ready for recommendations.")
+    # Define columns to be combined for the embedding corpus
+    columns_to_combine = [
+        "Title",
+        "Position",
+        "Company",
+        "City",
+        "State.Name",
+        "Industry",
+        "Job.Description",
+        "Requirements",
+        "Employment.Type",
+        "Education.Required",
+    ]
+    # Use only the columns that actually exist in the DataFrame
+    existing_columns = [col for col in columns_to_combine if col in jobs_df.columns]
     
-    corpus_embeddings = encode_corpus(model, tuple(job_corpus_texts_global))
+    jobs_df_filled = jobs_df[existing_columns].fillna("").astype(str)
+    # Combine columns into a single string for each job
+    processed_texts = jobs_df_filled.agg(" ".join, axis=1).tolist()
+    # Clean text by removing newline characters
+    cleaned_texts = [
+        text.replace("\n", " ").replace("\r", " ") for text in processed_texts
+    ]
     
-    if corpus_embeddings is not None:
-        st.header("🔍 Find Your Next Job")
-        user_query = st.text_area("Describe your ideal job or paste a job description:", height=150, placeholder="e.g., python developer with machine learning skills, remote work preferred...")
-        top_n = st.slider("Number of recommendations:", 1, 20, 10)
+    return jobs_df.copy(), cleaned_texts
 
-        if st.button("Get Recommendations", type="primary"):
+@st.cache_data
+def encode_corpus(_model, job_corpus_texts):
+    """
+    Encodes the job corpus using the provided model.
+    The result is cached to avoid re-calculating embeddings on every interaction.
+    """
+    if not job_corpus_texts or _model is None:
+        return None
+    with st.spinner("Encoding the job database... This may take a moment on first run."):
+        # Encode the text to create vector embeddings
+        corpus_embeddings = _model.encode(
+            job_corpus_texts, convert_to_tensor=True, show_progress_bar=False
+        )
+    return corpus_embeddings
+
+
+# --- Streamlit UI ---
+st.title("📄 Job Recommendation Engine")
+st.markdown(
+    "Enter your resume summary, skills, or a description of your ideal job below. The engine will compare your query against a database of 4,000 job descriptions to find the most relevant matches."
+)
+
+# --- Load Model and Data ---
+model = load_model(MODEL_NAME)
+if model:
+    jobs_df, job_corpus = load_and_process_job_data(JOBS_DATA_URL)
+    
+    if jobs_df is not None and job_corpus:
+        corpus_embeddings = encode_corpus(model, job_corpus)
+
+        # --- User Input ---
+        st.subheader("Your Job Query")
+        user_query = st.text_area(
+            "Enter your query here:",
+            "Seeking a senior software engineer role specializing in backend development with Python, Django, and cloud services like AWS.",
+            height=150,
+            label_visibility="collapsed"
+        )
+
+        col1, col2 = st.columns([3, 1])
+        with col1:
+             top_n = st.slider("Number of recommendations:", min_value=5, max_value=20, value=10)
+        with col2:
+            st.write("") # Spacer
+            st.write("") # Spacer
+            find_button = st.button("✨ Find My Dream Job", use_container_width=True)
+
+
+        if find_button:
             if not user_query.strip():
                 st.warning("Please enter a query.")
+            elif corpus_embeddings is None:
+                st.error("Could not generate corpus embeddings. Please check the data source.")
             else:
-                with st.spinner("Finding the best matches..."):
+                with st.spinner("Searching for the best matches..."):
+                    # Encode the user query into a vector
                     query_embedding = model.encode(user_query, convert_to_tensor=True)
-                    target_device = query_embedding.device
-                    corpus_embeddings_device = corpus_embeddings.to(target_device)
+
+                    # Compute cosine similarity between the query and all job descriptions
+                    cosine_scores = util.cos_sim(query_embedding, corpus_embeddings)[0]
                     
-                    cosine_scores = util.cos_sim(query_embedding, corpus_embeddings_device)[0]
-                    top_results = torch.topk(cosine_scores, k=min(top_n, len(job_corpus_texts_global)))
+                    # Get the top N results
+                    top_results = torch.topk(cosine_scores, k=min(top_n, len(job_corpus)))
 
-                    st.subheader(f"Top {len(top_results.values)} Job Recommendations:")
-                    
-                    if not top_results.values.numel():
-                        st.info("No recommendations found based on your query.")
-                    else:
-                        for i, (score, idx) in enumerate(zip(top_results.values, top_results.indices)):
-                            job_index = idx.item()
-                            original_job_series = jobs_df_original_global.iloc[job_index]
+                    st.success(f"Here are your top {top_n} job recommendations:")
 
-                            with st.expander(f"**Rank {i+1}: {original_job_series.get('Title', 'N/A')}** at **{original_job_series.get('Company', 'N/A')}** (Score: {score.item():.4f})"):
-                                st.markdown("---")
-                                col1, col2 = st.columns(2)
-                                with col1:
-                                    st.markdown(f"**Position:** `{original_job_series.get('Position', 'N/A')}`")
-                                    st.markdown(f"**Company:** `{original_job_series.get('Company', 'N/A')}`")
-                                    st.markdown(f"**Location:** `{original_job_series.get('City', '')}, {original_job_series.get('State.Name', '')}`")
-                                    st.markdown(f"**Job ID:** `{original_job_series.get('Job.ID', 'N/A')}`")
-                                with col2:
-                                    st.markdown(f"**Status:** `{original_job_series.get('Status', 'N/A')}`")
-                                    st.markdown(f"**Employment Type:** `{original_job_series.get('Employment.Type', 'N/A')}`")
-                                    st.markdown(f"**Education Required:** `{original_job_series.get('Education.Required', 'N/A')}`")
-                                    st.markdown(f"**Industry:** `{str(original_job_series.get('Industry', 'N/A'))}`")
-                                
-                                st.markdown("##### Job Description")
-                                st.text_area("Description", value=str(original_job_series.get('Job.Description', '')), height=200, disabled=True, label_visibility="collapsed", key=f"desc_{i}")
-                                
-                                requirements = str(original_job_series.get('Requirements', ''))
-                                if requirements and requirements.lower() != 'nan' and requirements.strip():
-                                    st.markdown("##### Requirements")
-                                    st.text_area("Requirements", value=requirements, height=150, disabled=True, label_visibility="collapsed", key=f"req_{i}")
-                                    
-                                salary = str(original_job_series.get('Salary', ''))
-                                if salary and salary.lower() != 'nan' and salary.strip():
-                                     st.markdown(f"**Salary:** `{salary}`")
+                    # Display results in a structured format
+                    results_list = []
+                    for i, (score, idx) in enumerate(zip(top_results.values, top_results.indices)):
+                        job_index = idx.item()
+                        original_job = jobs_df.iloc[job_index]
+                        results_list.append({
+                            "Rank": i + 1,
+                            "Score": f"{score.item():.4f}",
+                            "Title": original_job.get('Title', 'N/A'),
+                            "Company": original_job.get('Company', 'N/A'),
+                            "Location": f"{original_job.get('City', '')}, {original_job.get('State.Name', '')}"
+                        })
 
-    else:
-        st.error("Failed to generate corpus embeddings.")
+                    recommendations_df = pd.DataFrame(results_list)
+                    st.table(recommendations_df)
 else:
-    if model is None:
-        st.info("A trained model is required to proceed. Please check the model path in the sidebar or train a new model.")
-    else:
-        st.warning("Job corpus data could not be loaded. Please check the data source path in the sidebar.")
-
-st.sidebar.info("This app demonstrates job recommendations. If a trained model isn't found, you can train one using the button above (this is a one-time, lengthy process).")
-
+    st.error("The recommendation engine is currently unavailable. The model could not be loaded from Hugging Face Hub.")
